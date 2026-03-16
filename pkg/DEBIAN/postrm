@@ -1,0 +1,10 @@
+#!/usr/bin/perl
+use v5.40;
+
+my $action = $ARGV[0] // '';
+
+if ($action =~ /^(remove|purge|abort-install|disappear)$/) {
+    unlink '/etc/kernel/postinst.d/dracut';
+    system('dpkg-divert', '--package', 'gurb', '--rename', '--remove',
+           '/etc/kernel/postinst.d/dracut');
+}

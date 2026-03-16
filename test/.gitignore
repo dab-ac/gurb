@@ -1,0 +1,21 @@
+# Per-test run directories (parallel test support)
+run/
+
+# VM runtime state
+*.qcow2
+*.img
+*.iso
+*.sock
+*.pid
+*.log
+*.png
+*.ppm
+efivars.fd
+efivars-nosb.fd
+vm_key
+vm_key.pub
+vm_known_hosts
+vm_port
+user-data
+apt-cache/
+logs/

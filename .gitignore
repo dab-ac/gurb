@@ -1,0 +1,4 @@
+*.deb
+_build/
+scratch/
+.direnv/

@@ -1,0 +1,24 @@
+#cloud-config
+password: ubuntu
+chpasswd:
+  expire: false
+ssh_pwauth: true
+
+users:
+  - default
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - @SSH_PUBKEY@
+
+bootcmd:
+  - growpart /dev/vda 1 || true
+  - resize2fs /dev/vda1 || true
+  - umount /boot/efi || true
+  - mkdir -p /efi
+  - sed -i 's|/boot/efi|/efi|' /etc/fstab
+  - mount /efi
+  - mountpoint -q /boot/efi || mount --bind /efi /boot/efi
+  - mount -t virtiofs hostaptcache /var/cache/apt/archives || true

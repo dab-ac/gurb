@@ -1,0 +1,67 @@
+#!/usr/bin/env perl
+# test/vm — multi-tool CLI for VM lifecycle management.
+#
+# Usage:
+#   test/vm create [plucky|questing]
+#   test/vm start [--no-sb]
+#   test/vm stop
+#   test/vm restart [--no-sb]
+#   test/vm ssh [args...]
+#
+use v5.40;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use VMTest qw(ssh_cmd wait_ssh);
+use VMTest::VM;
+
+my $cmd = shift // usage();
+
+if ($cmd eq 'create') {
+    vm_create(
+        script_dir => $FindBin::Bin,
+        distro     => shift // 'plucky',
+    );
+} elsif ($cmd eq 'start') {
+    my $secure = parse_sb_flag(@ARGV);
+    vm_start(
+        script_dir => $FindBin::Bin,
+        secure     => $secure,
+    );
+} elsif ($cmd eq 'stop') {
+    vm_stop(script_dir => $FindBin::Bin);
+} elsif ($cmd eq 'destroy') {
+    vm_destroy(script_dir => $FindBin::Bin);
+} elsif ($cmd eq 'restart') {
+    my $secure = parse_sb_flag(@ARGV);
+    vm_restart(
+        script_dir => $FindBin::Bin,
+        secure     => $secure,
+    );
+} elsif ($cmd eq 'wait') {
+    VMTest::init(ssh_dir => $FindBin::Bin, vm_dir => $FindBin::Bin,
+                 tmux_session => 'gurb-vm');
+    wait_ssh(shift // 180);
+} elsif ($cmd eq 'ssh') {
+    exec ssh_cmd($FindBin::Bin), @ARGV;
+} else {
+    usage();
+}
+
+sub parse_sb_flag (@args) {
+    for (@args) {
+        return 0 if $_ eq '--no-sb';
+    }
+    return 1;
+}
+
+sub usage {
+    say STDERR "Usage: test/vm {create|start|stop|destroy|restart|ssh} [options]";
+    say STDERR "  create [distro]   Create VM disk (default: plucky)";
+    say STDERR "  start [--no-sb]   Start VM (default: Secure Boot ON)";
+    say STDERR "  stop              Stop QEMU (virtiofsd kept alive)";
+    say STDERR "  destroy           Kill everything (QEMU, virtiofsd, tmux)";
+    say STDERR "  restart [--no-sb] Restart VM";
+    say STDERR "  wait [timeout]    Wait for SSH (default: 180s)";
+    say STDERR "  ssh [args...]     SSH into VM";
+    exit 1;
+}

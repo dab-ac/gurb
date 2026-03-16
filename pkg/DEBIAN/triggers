@@ -1,0 +1,3 @@
+interest-noawait /usr/lib/shim/shimx64.efi.signed.latest
+interest-noawait /usr/lib/shim/mmx64.efi
+interest-noawait /usr/lib/systemd/boot/efi/systemd-bootx64.efi

@@ -1,0 +1,594 @@
+#!/usr/bin/env perl
+use v5.40;
+use Getopt::Long qw(:config gnu_getopt no_auto_abbrev);
+use File::Basename qw(basename dirname);
+use File::Temp qw(tempfile tempdir);
+use Cwd;
+use POSIX qw(strftime);
+
+# ── globals ──────────────────────────────────────────────────────────────────
+
+my $dry_run = 0;
+my $force   = 0;
+
+# ── config ───────────────────────────────────────────────────────────────────
+
+sub read_config ($path) {
+    my %cfg;
+    open my $fh, '<', $path or return %cfg;
+    while (<$fh>) {
+        chomp; s/#.*//; next unless /\S/;
+        my ($k, $v) = split /\s*=\s*/, $_, 2;
+        next unless defined $v;
+        $cfg{trim($k)} = trim($v);
+    }
+    return %cfg;
+}
+
+# defaults < config file < env
+my $shim_efi      = '/efi/EFI/systemd/shimx64.efi';
+my $uki_dir       = '/efi/EFI/Linux';
+my $cmdline_extra = '';
+
+my %cfg = read_config('/etc/gurb/config');
+$shim_efi      = $cfg{shim}          // $shim_efi;
+$uki_dir       = $cfg{uki_dir}       // $uki_dir;
+$cmdline_extra = $cfg{cmdline_extra} // $cmdline_extra;
+
+$shim_efi      = $ENV{GURB_SHIM}          // $shim_efi;
+$uki_dir       = $ENV{GURB_UKI_DIR}       // $uki_dir;
+$cmdline_extra = $ENV{GURB_CMDLINE_EXTRA} // $cmdline_extra;
+my $shim_dir   = dirname($shim_efi);
+
+# signing paths from uki.conf
+my $uki_conf = '/etc/kernel/uki.conf';
+my %uki      = read_config($uki_conf);
+my $mok_key  = $uki{SecureBootPrivateKey}  // '';
+my $mok_cert = $uki{SecureBootCertificate} // '';
+
+my $mok_der;
+if ($mok_cert =~ /^(.+)\.pem$/) {
+    $mok_der = "$1.der";
+} elsif ($mok_cert ne '') {
+    die "error: SecureBootCertificate must end in .pem, got: $mok_cert\n";
+}
+
+# ── logging & abort ──────────────────────────────────────────────────────────
+
+sub fatal (@msg) { die "error: @msg\n" }
+
+# ── safe command capture ─────────────────────────────────────────────────────
+# List-form pipe open: no shell interpolation, no injection.
+
+sub capture (@cmd) {
+    open my $fh, '-|', @cmd or fatal("failed to run: @cmd");
+    my $out = do { local $/; <$fh> } // '';
+    close $fh;
+    chomp $out;
+    return $out;
+}
+
+sub capture_both (@cmd) {
+    # Capture stdout+stderr merged via fork.
+    my $pid = open my $fh, '-|';
+    fatal("fork failed: $!") unless defined $pid;
+    if ($pid == 0) {
+        open STDERR, '>&', \*STDOUT;
+        exec @cmd or die "exec failed: $!\n";
+    }
+    my $out = do { local $/; <$fh> } // '';
+    close $fh;
+    my $rc = $?;
+    chomp $out;
+    return ($out, $rc);
+}
+
+# ── dry-run primitives ───────────────────────────────────────────────────────
+
+sub run (@cmd) {
+    my %opts = ref $cmd[0] eq 'HASH' ? %{shift @cmd} : ();
+    if ($dry_run) { warn "  exec: @cmd\n"; return }
+    my $prev;
+    if ($opts{chdir}) {
+        $prev = Cwd::getcwd();
+        chdir $opts{chdir} or fatal("chdir $opts{chdir}: $!");
+    }
+    system(@cmd) == 0 or fatal("command failed: @cmd");
+    chdir $prev if $prev;
+    return;
+}
+
+sub _write ($path, $content) {
+    if ($dry_run) { warn "  write: $path\n"; return }
+    open my $fh, '>', $path or fatal("cannot write $path: $!");
+    print $fh $content;
+}
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+sub require_uki_conf () {
+    -f $uki_conf   or fatal("$uki_conf not found");
+    $mok_key  ne '' or fatal("SecureBootPrivateKey not set in $uki_conf");
+    $mok_cert ne '' or fatal("SecureBootCertificate not set in $uki_conf");
+}
+
+sub require_key () {
+    require_uki_conf();
+    -f $mok_key  or fatal("Key not found: $mok_key — run: gurb generate");
+    -f $mok_cert or fatal("Cert not found: $mok_cert — run: gurb generate");
+}
+
+sub sign_pe ($src, $dst) {
+    if ($dry_run) {
+        warn "  exec: sbsign --key $mok_key --cert $mok_cert --output $dst $src\n";
+        return;
+    }
+    my ($fh, $tmp) = tempfile("${dst}.XXXXXX", UNLINK => 0);
+    close $fh;
+    try {
+        system('sbsign', '--key', $mok_key, '--cert', $mok_cert,
+               '--output', $tmp, $src) == 0
+            or die "sbsign failed\n";
+        rename $tmp, $dst or die "rename: $!\n";
+    } catch ($e) {
+        unlink $tmp;
+        fatal("sbsign failed for: $src");
+    }
+}
+
+# Returns: enrolled | pending | blocked | missing
+sub mok_state () {
+    return 'missing' unless defined $mok_der && -f $mok_der;
+    my ($out, $rc) = capture_both('mokutil', '--test-key', $mok_der);
+    # exit 0 = not enrolled (mokutil 0.7.2); exit 1 = present in some form
+    return 'missing' if $rc == 0;
+    return 'enrolled' if $out =~ /is already enrolled/ || $out =~ /is already in db/;
+    return 'pending'  if $out =~ /is already in the enrollment request/;
+    return 'blocked'  if $out =~ /is blocked/;
+    return 'missing';
+}
+
+sub vercmp ($a, $b) {
+    # Port of glibc/gnulib filevercmp: split into ~, digit-runs, non-digit-runs,
+    # compare ~ < empty < letter < non-letter, digits numerically.
+    my @a = ($a =~ /(~|\d+|[^\d~]+)/g);
+    my @b = ($b =~ /(~|\d+|[^\d~]+)/g);
+    for my $i (0 .. ($#a > $#b ? $#a : $#b)) {
+        my ($x, $y) = ($a[$i] // '', $b[$i] // '');
+        # ~ sorts before everything, including empty string
+        if ($x eq '~' || $y eq '~') {
+            return  0 if $x eq '~' && $y eq '~';
+            return -1 if $x eq '~';
+            return  1;
+        }
+        # empty string (shorter version) sorts before any non-~ content
+        return -1 if $x eq '' && $y ne '';
+        return  1 if $y eq '' && $x ne '';
+        my $c = ($x =~ /^\d+$/ && $y =~ /^\d+$/)
+               ? $x <=> $y
+               : $x cmp $y;
+        return $c if $c;
+    }
+    return 0;
+}
+
+sub confirm ($prompt) {
+    print $prompt;
+    (<STDIN> // '') =~ /^[yY]$/;
+}
+
+sub esp_mount () {
+    my $mount = capture('findmnt', '-n', '-o', 'TARGET', '--target', $shim_dir);
+    if ($mount eq '' || $mount eq '/') {
+        fatal("ESP not mounted — $shim_dir resolves to root filesystem.\n" .
+              "  Mount your ESP (e.g., mount /dev/sdX15 /efi) or set shim= in /etc/gurb/config.");
+    }
+    return $mount;
+}
+
+sub collect_binaries () {
+    grep { -f } $shim_efi, "$shim_dir/mmx64.efi", "$shim_dir/grubx64.efi",
+                glob("$uki_dir/*.efi");
+}
+
+# Structured openssl x509 field extraction (no regex on human-readable output)
+sub x509_field ($cert, @args) {
+    capture('openssl', 'x509', '-in', $cert, @args);
+}
+
+# Extract subject fields via -nameopt multiline (one field per line, structured)
+sub x509_subject_field ($cert, $field_name, @extra) {
+    my $out = capture('openssl', 'x509', @extra, '-in', $cert,
+                      '-subject', '-nameopt', 'multiline', '-noout');
+    for my $line (split /\n/, $out) {
+        if ($line =~ /^\s+\Q$field_name\E\s*=\s*(.*)/) {
+            return $1;
+        }
+    }
+    return '';
+}
+
+# ── commands ─────────────────────────────────────────────────────────────────
+
+sub cmd_generate () {
+    require_uki_conf();
+
+    if (-f $mok_key || -f $mok_cert) {
+        say "Existing key:";
+        print_key_info() if -f $mok_cert;
+        unless (confirm("Overwrite? [y/N] ")) {
+            say "Aborted."; exit 0;
+        }
+    }
+
+    my $dir = dirname($mok_key);
+    my $cn  = substr(capture('hostname', '-s'), 0, 31) . ' Secure Boot';
+
+    if ($dry_run) {
+        warn "  exec: mkdir -p $dir\n";
+        warn "  exec: openssl req ... CN=\"$cn\" O=gurb -> $mok_key, $mok_cert\n";
+        warn "  exec: openssl x509 -outform DER -> $mok_der\n";
+    } else {
+        run('mkdir', '-p', $dir);
+        chmod 0700, $dir;
+        system('openssl', 'req', '-new', '-x509', '-newkey', 'rsa:4096', '-nodes',
+               '-keyout', $mok_key, '-out', $mok_cert,
+               '-days', '7300',
+               '-subj', "/O=gurb/CN=$cn/",
+               '-addext', 'extendedKeyUsage = codeSigning',
+               '-addext', 'basicConstraints = critical,CA:FALSE',
+               '-addext', 'subjectKeyIdentifier = hash',
+               '-addext', 'keyUsage = digitalSignature') == 0
+            or fatal("openssl req failed");
+        system('openssl', 'x509', '-in', $mok_cert, '-outform', 'DER',
+               '-out', $mok_der) == 0
+            or fatal("openssl x509 DER conversion failed");
+        chmod 0600, $mok_key, $mok_cert, $mok_der;
+        say "Generated: $mok_key";
+        say "Generated: $mok_cert";
+        say "Generated: $mok_der";
+    }
+
+    cmd_enroll();
+}
+
+sub cmd_enroll () {
+    require_uki_conf();
+
+    my $state = mok_state();
+    if ($state eq 'enrolled') {
+        say "MOK is already enrolled. Nothing to do."; return;
+    } elsif ($state eq 'pending') {
+        say "MOK enrollment is already pending. Reboot and confirm in MokManager."; return;
+    } elsif ($state eq 'blocked') {
+        fatal("MOK is in the blocklist (dbx or MokListX). Remove it first.");
+    }
+
+    run('mokutil', '--import', $mok_der);
+    say "Reboot and confirm enrollment in MokManager to activate.";
+}
+
+sub cmd_clean () {
+    require_uki_conf();
+    -f $mok_cert or fatal("Cert not found: $mok_cert — run: gurb generate");
+
+    my @binaries = collect_binaries();
+
+    # Export enrolled MOKs as individual DER files into a tmpdir
+    my $tmpdir = tempdir('gurb-clean.XXXXXX', TMPDIR => 1, CLEANUP => 1);
+    # run('mokutil', '--export', '--dir', $tmpdir); # TODO: --dir not in Plucky's mokutil yet
+    run({chdir => $tmpdir}, 'mokutil', '--export');
+    my @ders = sort glob "$tmpdir/MOK-*.der";
+
+    if (!@ders) {
+        say "No MOK entries found in NVRAM.";
+    } else {
+        for my $der (@ders) {
+            my $cn     = x509_subject_field($der, 'commonName', '-inform', 'DER');
+            $cn = substr($cn, 0, 48) if length $cn > 48;
+            $cn = '(unknown)' if $cn eq '';
+
+            my $expiry = x509_field($der, '-inform', 'DER', '-enddate', '-noout');
+            $expiry =~ s/^notAfter=//;
+
+            my $fp = x509_field($der, '-inform', 'DER', '-fingerprint', '-sha256', '-noout');
+            $fp =~ s/^.*=//;
+            $fp =~ s/://g;
+            $fp = substr($fp, -16);
+
+            # Check if this cert signs any of our binaries
+            my $used = 0;
+            for my $bin (@binaries) {
+                my (undef, $rc) = capture_both('sbverify', '--cert', $der, $bin);
+                if ($rc == 0) {
+                    $used = 1; last;
+                }
+            }
+
+            if ($used) {
+                printf "KEEP   CN=%-48s  exp=%-20s  ...%s\n", $cn, $expiry, $fp;
+            } else {
+                printf "UNUSED CN=%-48s  exp=%-20s  ...%s\n", $cn, $expiry, $fp;
+                if (confirm("  Delete this MOK? [y/N] ")) {
+                    run('mokutil', '--delete', $der);
+                }
+            }
+        }
+    }
+
+    if (mok_state() eq 'missing') {
+        say "Our MOK is not enrolled — running enroll.";
+        cmd_enroll();
+    }
+}
+
+sub cmd_resign ($target) {
+    $target or fatal("resign requires 'all' or a kernel version. Use --help.");
+    require_key();
+
+    my $state = mok_state();
+    if ($state eq 'missing') {
+        $force or fatal("MOK is not enrolled. Run: gurb enroll, or use --force.");
+        warn "warning: MOK not enrolled — signed binaries will not be trusted by shim.\n";
+    } elsif ($state eq 'pending') {
+        $force or fatal("MOK pending enrollment. Reboot and confirm in MokManager first, or use --force.");
+        warn "warning: MOK pending — signatures won't validate until after reboot and MokManager confirmation.\n";
+    }
+
+    # Re-sign systemd-boot
+    my $sd_boot = '/usr/lib/systemd/boot/efi/systemd-bootx64.efi';
+    if (-f $sd_boot) {
+        sign_pe($sd_boot, "$shim_dir/grubx64.efi");
+        say "Signed: $shim_dir/grubx64.efi";
+    } else {
+        warn "warning: systemd-bootx64.efi not found, skipping bootloader.\n";
+    }
+
+    if ($target eq 'all') {
+        my @imgs = glob '/boot/vmlinuz-*';
+        @imgs or fatal("No installed kernel versions found.");
+        for my $img (@imgs) {
+            my $kver = $img =~ s{^/boot/vmlinuz-}{}r;
+            say "Rebuilding UKI for $kver...";
+            run('kernel-install', 'add', $kver, $img);
+        }
+    } else {
+        my $img = "/boot/vmlinuz-$target";
+        -f $img or fatal("Kernel version not found: $target");
+        say "Rebuilding UKI for $target...";
+        run('kernel-install', 'add', $target, $img);
+    }
+}
+
+sub cmd_cmdline () {
+    my $new = capture('dracut', '--print-cmdline');
+    $new = trim($new);
+    $new =~ s/\s+/ /g;
+    $new .= " $cmdline_extra" if $cmdline_extra ne '';
+
+    if (! -f '/etc/kernel/cmdline') {
+        say "No existing /etc/kernel/cmdline. Would write:";
+        say "  $new";
+        return unless confirm("Write? [y/N] ");
+        _write('/etc/kernel/cmdline', "$new\n");
+        return;
+    }
+
+    open my $cfh, '<', '/etc/kernel/cmdline' or fatal("read /etc/kernel/cmdline: $!");
+    my $existing = do { local $/; <$cfh> };
+    chomp $existing;
+
+    if ($new eq $existing) {
+        say "/etc/kernel/cmdline is already up to date.";
+        return;
+    }
+
+    my ($ta, $file_a) = tempfile(UNLINK => 1);
+    my ($tb, $file_b) = tempfile(UNLINK => 1);
+    print $ta "$existing\n"; close $ta;
+    print $tb "$new\n";      close $tb;
+    system('diff', $file_a, $file_b);
+
+    return unless confirm("Replace /etc/kernel/cmdline with the above? [y/N] ");
+    _write('/etc/kernel/cmdline', "$new\n");
+}
+
+# Display key/cert details. Returns list of warning strings (empty = all OK).
+sub print_key_info () {
+    my @warnings;
+    my $cn        = x509_subject_field($mok_cert, 'commonName');
+    my $org       = x509_subject_field($mok_cert, 'organizationName');
+    my $not_before = x509_field($mok_cert, '-startdate', '-noout');
+    $not_before =~ s/^notBefore=//;
+    my $expiry    = x509_field($mok_cert, '-enddate', '-noout');
+    $expiry =~ s/^notAfter=//;
+
+    # EKU via -ext: OpenSSL renders codeSigning as "Code Signing" (canonical,
+    # not locale-dependent) and unknown OIDs as their dotted numeric form.
+    my $eku_raw = x509_field($mok_cert, '-ext', 'extendedKeyUsage', '-noout');
+    my $eku_text = join ', ', grep { /\S/ && !/X509v3/ }
+                   map { trim($_) } split /\n/, $eku_raw;
+
+    printf "Key:      %s\n", $mok_key;
+    printf "Cert:     %s\n", $mok_cert;
+    printf "DER:      %s\n", $mok_der;
+    printf "CN:       %s\n", $cn;
+    printf "O:        %s\n", $org;
+    printf "Generated:%s\n", $not_before;
+    printf "Expires:  %s\n", $expiry;
+    printf "EKU:      %s",   $eku_text;
+
+    if ($eku_text !~ /Code Signing/) {
+        print '  ← WARNING: codeSigning not set';
+        push @warnings, 'codeSigning not set';
+    }
+    if ($eku_text =~ /1\.3\.6\.1\.4\.1\.2312\.16\.1\.2/) {  # modsign OID
+        print '  ← WARNING: modsign OID present — shim will REJECT this cert';
+        push @warnings, 'modsign OID present';
+    }
+    print "\n";
+
+    if (-f $mok_key) {
+        my $key_mode = (stat $mok_key)[2] & 07777;
+        my $dir_mode = (stat dirname($mok_key))[2] & 07777;
+        if ($key_mode & 0077 || $dir_mode & 0077) {
+            printf "WARNING: %s has mode %04o (dir %04o) — accessible by non-root users.\n",
+                   $mok_key, $key_mode, $dir_mode;
+            say "  The private key may have been compromised. Rotate with: gurb generate";
+            push @warnings, 'key permissions too loose';
+        }
+    }
+
+    return @warnings;
+}
+
+sub cmd_status () {
+    require_uki_conf();
+    my $rc  = 0;
+    my $fmt = "%-12s  %-52s  %-16s  %s\n";
+
+    my $check_sig = sub ($path) {
+        my (undef, $exit) = capture_both('sbverify', '--cert', $mok_cert, $path);
+        return 'SIGNED' if $exit == 0;
+        my $list = capture('sbverify', '--list', $path);
+        return 'SIGNED(other)' if $list =~ /signature \d+/;
+        return 'UNSIGNED';
+    };
+
+    my $status_line = sub ($path, $label) {
+        unless (-f $path) {
+            printf $fmt, $label, $path, '', 'MISSING';
+            $rc = 1; return;
+        }
+        my $mtime = strftime('%Y-%m-%d %H:%M', localtime((stat $path)[9]));
+        my $sig   = $check_sig->($path);
+        $rc = 1 if $sig ne 'SIGNED';
+        printf $fmt, $label, $path, $mtime, $sig;
+    };
+
+    printf $fmt, 'WHAT', 'PATH', 'MTIME', 'SIG';
+    say '-' x 68;
+
+    $status_line->($shim_efi,               'shim');
+    $status_line->("$shim_dir/mmx64.efi",   'mm');
+    $status_line->("$shim_dir/grubx64.efi", 'systemd-boot');
+
+    for my $uki (sort glob "$uki_dir/*.efi") {
+        next unless -f $uki;
+        $status_line->($uki, basename($uki, '.efi'));
+    }
+
+    print "\n";
+
+    # Key/cert status
+    if (-f $mok_cert) {
+        my @warnings = print_key_info();
+        $rc = 1 if @warnings;
+
+        # DER sync check
+        if (-f $mok_der) {
+            my $pem_fp = x509_field($mok_cert, '-fingerprint', '-sha256', '-noout');
+            my $der_fp = x509_field($mok_der, '-inform', 'DER', '-fingerprint', '-sha256', '-noout');
+            s/^.*=// for $pem_fp, $der_fp;
+            if ($pem_fp ne $der_fp) {
+                say "WARNING: MOK.der and MOK.pem do not match — run: gurb enroll";
+                $rc = 1;
+            }
+        } else {
+            say "WARNING: $mok_der missing — run: gurb enroll";
+            $rc = 1;
+        }
+
+        printf "MOK:      %s\n", mok_state();
+    } else {
+        say "Key/cert not found — run: gurb generate";
+        $rc = 1;
+    }
+
+    # Suggest grub cleanup
+    my @grub_installed;
+    for my $pkg (qw(grub-common grub2-common grub-efi-amd64-signed grub-pc)) {
+        my ($st) = capture_both('dpkg-query', '-W', '-f', '${Status}', $pkg);
+        push @grub_installed, $pkg if $st =~ /install ok installed/;
+    }
+    if (@grub_installed) {
+        say "\nGRUB is still installed (@grub_installed).";
+        say "Once gurb is verified working, remove it:";
+        say "  sudo apt purge @grub_installed && sudo rm -rf /boot/grub";
+    } elsif (-d '/boot/grub') {
+        say "\n/boot/grub leftover (causes shim-signed postinst errors). Clean up:";
+        say "  sudo rm -rf /boot/grub";
+    }
+
+    my $fb = "$shim_dir/fbx64.efi";
+    if (-f $fb && $shim_dir =~ m{/EFI/BOOT$}i) {
+        say "\nWARNING: $fb exists — shim will chain to it instead of systemd-boot.";
+        say "  Remove it: sudo rm $fb";
+        $rc = 1;
+    }
+
+    return $rc;
+}
+
+sub cmd_bootentry () {
+    -f $shim_efi or fatal("Shim not found at $shim_efi");
+
+    my $esp_mount = capture('findmnt', '-n', '-o', 'TARGET', '--first-only', '--target', $shim_dir);
+    $esp_mount ne '' or fatal("Could not determine ESP mount point from $shim_dir");
+
+    my $esp_device = capture('findmnt', '-n', '-o', 'SOURCE', '--first-only', '--mountpoint', $esp_mount);
+    $esp_device ne '' or fatal("Could not determine ESP device");
+
+    my $disk = capture('lsblk', '-no', 'PKNAME', $esp_device);
+    $disk ne '' or fatal("Could not determine disk for $esp_device");
+
+    my $part_num = capture('lsblk', '-no', 'PARTN', $esp_device);
+    $part_num ne '' or fatal("Could not determine partition number for $esp_device");
+
+    # Convert Unix path to EFI backslash path, strip ESP mount prefix
+    (my $efi_path = $shim_efi) =~ s/^\Q$esp_mount\E//;
+    $efi_path =~ s|/|\\|g;
+
+    run('efibootmgr', '--create-only',
+          '--disk', "/dev/$disk",
+          '--part', $part_num,
+          '--label', 'shimmed systemd-boot',
+          '--loader', $efi_path);
+}
+
+# ── argument parsing ─────────────────────────────────────────────────────────
+
+my $help = 0;
+GetOptions(
+    'dry-run' => \$dry_run,
+    'force'   => \$force,
+    'help|h'  => \$help,
+) or die "Usage: gurb [--dry-run] [--force] <command> [args]\n";
+
+if ($help) {
+    system('man', 'gurb') == 0
+        or say "Usage: gurb [--dry-run] [--force] <command> [args]\n",
+               "Commands: generate enroll clean resign cmdline status bootentry\n",
+               "Run: man gurb  for full documentation.";
+    exit 0;
+}
+
+if (!@ARGV) {
+    warn "Use --help to see all commands.\n";
+    exit cmd_status();
+}
+
+my $cmd = shift @ARGV;
+my %dispatch = (
+    generate  => \&cmd_generate,
+    enroll    => \&cmd_enroll,
+    clean     => \&cmd_clean,
+    resign    => sub { cmd_resign($ARGV[0]) },
+    cmdline   => \&cmd_cmdline,
+    status    => \&cmd_status,
+    bootentry => \&cmd_bootentry,
+);
+
+my $handler = $dispatch{$cmd} or fatal("unknown command: $cmd  (use --help)");
+my $rc = $handler->() // 0;
+exit $rc;

@@ -1,0 +1,5 @@
+#!/bin/sh
+set -e
+version="$1"
+[ -z "$version" ] && exit 0
+exec kernel-install remove "$version"

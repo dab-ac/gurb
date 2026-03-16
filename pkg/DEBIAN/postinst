@@ -1,0 +1,77 @@
+#!/usr/bin/perl
+use v5.40;
+use File::Basename qw(dirname);
+
+sub read_config ($path) {
+    my %cfg;
+    open my $fh, '<', $path or return %cfg;
+    while (<$fh>) {
+        chomp; s/#.*//; next unless /\S/;
+        my ($k, $v) = split /\s*=\s*/, $_, 2;
+        next unless defined $v;
+        $cfg{trim($k)} = trim($v);
+    }
+    return %cfg;
+}
+
+my %cfg = read_config('/etc/gurb/config');
+my $shim_efi = $cfg{shim} // '/efi/EFI/systemd/shimx64.efi';
+my $shim_dir = dirname($shim_efi);
+
+my %uki = read_config('/etc/kernel/uki.conf');
+my $mok_key  = $uki{SecureBootPrivateKey}  // '';
+my $mok_cert = $uki{SecureBootCertificate} // '';
+
+sub install_shim () {
+    my $src = '/usr/lib/shim/shimx64.efi.signed.latest';
+    return unless -f $src;
+    system('mkdir', '-p', $shim_dir) == 0 or die "mkdir $shim_dir: $!\n";
+    system('cp', $src, $shim_efi) == 0 or die "cp shim: $!\n";
+    my $mm = '/usr/lib/shim/mmx64.efi';
+    system('cp', $mm, "$shim_dir/mmx64.efi") if -f $mm;
+
+    my $fb = "$shim_dir/fbx64.efi";
+    if (-f $fb && $shim_dir =~ m{/EFI/BOOT$}i) {
+        warn "gurb: WARNING: $fb exists — shim will chain to it instead of systemd-boot.\n";
+        warn "  Remove it: sudo rm $fb\n";
+    }
+}
+
+sub install_bootloader () {
+    my $src = '/usr/lib/systemd/boot/efi/systemd-bootx64.efi';
+    return unless -f $src;
+    if ($mok_key eq '' || $mok_cert eq '') {
+        warn "gurb: SecureBootPrivateKey/Certificate not set in uki.conf, skipping bootloader sign\n";
+        return;
+    }
+    unless (-f $mok_key && -f $mok_cert) {
+        warn "gurb: key or cert file missing, skipping bootloader sign (run: gurb generate)\n";
+        return;
+    }
+    system('mkdir', '-p', $shim_dir) == 0 or die "mkdir $shim_dir: $!\n";
+    system('sbsign', '--key', $mok_key, '--cert', $mok_cert,
+           '--output', "$shim_dir/grubx64.efi", $src) == 0
+        or die "sbsign failed\n";
+}
+
+my $action = $ARGV[0] // '';
+
+if ($action eq 'configure') {
+    system('dpkg-divert', '--package', 'gurb', '--rename',
+           '--divert', '/etc/kernel/postinst.d/dracut.distrib',
+           '/etc/kernel/postinst.d/dracut') == 0
+        or die "dpkg-divert failed\n";
+
+    unless (-f '/etc/kernel/postinst.d/dracut') {
+        open my $fh, '>', '/etc/kernel/postinst.d/dracut' or die "write dracut: $!\n";
+        print $fh "#!/bin/sh\n# Diverted by gurb. kernel-install handles kernel installation.\nexit 0\n";
+        close $fh;
+        chmod 0755, '/etc/kernel/postinst.d/dracut';
+    }
+
+    install_shim();
+    install_bootloader();
+} elsif ($action eq 'triggered') {
+    install_shim();
+    install_bootloader();
+}

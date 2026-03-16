@@ -1,0 +1,250 @@
+.TH GURB 8 "2025" "gurb" "System Administration"
+.SH NAME
+gurb \- Secure Boot lifecycle management for systemd\-boot under shim
+.SH SYNOPSIS
+.B gurb
+[\fB\-\-dry\-run\fR]
+[\fB\-\-force\fR]
+.I command
+[\fIargs\fR]
+.SH DESCRIPTION
+.B gurb
+manages a Secure Boot setup where
+.BR shimx64.efi (1)
+chainloads a signed
+.BR systemd\-boot (1)
+binary (installed as
+.IR grubx64.efi ),
+which in turn loads Unified Kernel Images (UKIs) built by
+.BR ukify (1)
+via
+.BR kernel\-install (8).
+.PP
+The package provides dummy satisfiers for GRUB's dpkg dependencies so that
+.B shim\-signed
+installs without pulling in GRUB.
+Kernel installation is handled by
+.BR kernel\-install (8)
+rather than the legacy
+.I /etc/kernel/postinst.d/dracut
+hook, which is diverted to a no\-op.
+.PP
+All signing uses
+.BR sbsign (1).
+Key and certificate paths are read from
+.IR /etc/kernel/uki.conf ,
+so ukify and gurb always agree on which key to use.
+.SH COMMANDS
+.TP
+.B generate
+Generate a new 4096\-bit RSA key and self\-signed certificate at the paths
+configured in
+.IR /etc/kernel/uki.conf .
+The certificate subject is
+.BI "O=gurb, CN=" hostname\ Secure\ Boot
+with
+.B extendedKeyUsage=codeSigning
+and
+.B CA:FALSE.
+A DER copy is also written for use with
+.BR mokutil (1).
+Immediately calls
+.B enroll
+on completion.
+Prompts before overwriting an existing key.
+.TP
+.B enroll
+Import the DER certificate into the MokManager enrollment queue via
+.BR "mokutil \-\-import" .
+No\-op if the key is already enrolled or already pending.
+A reboot is required after enrollment; MokManager will prompt for confirmation.
+.TP
+.B clean
+List all MOK entries currently in NVRAM.
+For each entry, checks whether any currently installed signed binary (shim,
+mmx64, systemd\-boot, UKIs) was signed by that certificate.
+Entries not used by any binary are offered for deletion one by one.
+After processing, enrolls our MOK if it is not present.
+.TP
+\fBresign\fR \fIall\fR|\fIkver\fR
+Re\-sign systemd\-boot and rebuild UKIs for the specified kernel version, or
+all installed versions.
+UKIs are rebuilt by calling
+.B "kernel\-install add"
+.I kver
+.I /usr/lib/modules/kver/vmlinuz
+which exercises the full normal build path (dracut initrd, ukify UKI, sbsign).
+.br
+Refuses to run unless the MOK is enrolled.
+If the MOK is pending (enrolled but not yet confirmed in MokManager), refuses
+unless
+.B \-\-force
+is given, with a warning that signatures will not validate until after reboot
+and MokManager confirmation.
+.TP
+.B cmdline
+Runs
+.B "dracut \-\-print\-cmdline"
+and appends
+.B cmdline_extra
+from the config file.
+Shows a diff against
+.I /etc/kernel/cmdline
+and prompts before replacing it.
+.TP
+.B status
+Prints a table of all managed binaries (shim, mmx64, systemd\-boot, all UKIs)
+showing path, modification time, and signature status (SIGNED / SIGNED(other)
+/ UNSIGNED / MISSING).
+All binaries are checked without short\-circuiting.
+.br
+Also prints key and certificate details: CN, O, generation date, expiry, EKU,
+and MOK enrollment state.
+Warns if EKU is wrong or if the modsign OID is present (which causes shim to
+reject the certificate).
+Checks that the PEM and DER files match.
+.br
+Default command when invoked with no arguments.
+.TP
+.B bootentry
+Creates an EFI NVRAM boot entry named
+.B "shimmed systemd\-boot"
+pointing to the shim binary.
+The ESP device is auto\-detected from the shim path.
+The entry is created without modifying
+.BR BootOrder .
+.SH OPTIONS
+.TP
+.B \-\-dry\-run
+Print all actions that would be taken without executing any of them.
+.TP
+.B \-\-force
+Allow
+.B resign
+to proceed even when the MOK is pending or not enrolled.
+.TP
+.BR \-h ", " \-\-help
+Show a brief usage summary.
+.SH CONFIGURATION
+.SS /etc/kernel/uki.conf
+This file is read by both
+.BR ukify (1)
+and
+.BR gurb (8)
+for signing key paths. The relevant keys under
+.B [UKI]
+are:
+.TP
+.B SecureBootPrivateKey
+Path to the PEM private key used by
+.BR sbsign (1).
+.TP
+.B SecureBootCertificate
+Path to the PEM certificate.
+.PP
+The DER certificate (for
+.BR mokutil (1))
+is derived from the PEM path by replacing the
+.B .pem
+extension with
+.BR .der .
+.SS /etc/gurb/config
+Optional. Key\-value pairs, one per line, in the form
+.BR key=value .
+No quoting or shell syntax. Recognised keys:
+.TP
+.B shim
+Full path to
+.I shimx64.efi
+on the ESP.
+All other ESP files (mmx64.efi, grubx64.efi) are placed in the same directory.
+Default:
+.IR /efi/EFI/systemd/shimx64.efi .
+.TP
+.B uki_dir
+Directory where UKIs are stored on the ESP.
+Default:
+.IR /efi/EFI/Linux .
+.TP
+.B cmdline_extra
+Extra tokens appended to the
+.BR dracut (8)
+cmdline output by the
+.B cmdline
+command.
+Default: empty.
+.SS Environment variables
+The following environment variables override config file values:
+.TP
+.B GURB_SHIM
+Overrides
+.BR shim .
+.TP
+.B GURB_UKI_DIR
+Overrides
+.BR uki_dir .
+.TP
+.B GURB_CMDLINE_EXTRA
+Overrides
+.BR cmdline_extra .
+.SH SECURE BOOT KEY NOTES
+One key satisfies all three verification steps:
+.IP 1. 3
+.B shim
+verifying systemd\-boot via the MOK database
+.IP 2. 3
+.B systemd\-boot
+verifying UKIs via the ShimLock protocol (which delegates to shim)
+.IP 3. 3
+The
+.B kernel
+verifying module signatures
+.PP
+The certificate must have
+.B extendedKeyUsage=codeSigning
+and must
+.I not
+contain the modsign OID
+.RB ( 1.3.6.1.4.1.2312.16.1.2 ).
+Shim's
+.I verify_eku()
+function explicitly blacklists that OID: any certificate in MOK that contains
+it will be rejected for EFI binary verification.
+The kernel does not check EKU at all for module signing.
+.PP
+Canonical's signing certificate is compiled into the shim binary as
+.I vendor_cert
+and is not present in MOK NVRAM.
+.SH FILES
+.I /etc/gurb/config
+.br
+.I /etc/kernel/uki.conf
+.br
+.I /etc/kernel/install.conf
+.br
+.I /etc/kernel/install.d/05\-vmlinuz\-symlink.install
+.br
+.I /etc/kernel/postinst.d/zz\-gurb
+.br
+.I /etc/kernel/postrm.d/zz\-gurb
+.br
+.I /etc/kernel/postinst.d/dracut
+(diverted from dracut package, replaced with exit\-0 no\-op)
+.SH SEE ALSO
+.BR kernel\-install (8),
+.BR ukify (1),
+.BR dracut (8),
+.BR sbsign (1),
+.BR sbverify (1),
+.BR mokutil (1),
+.BR efibootmgr (8),
+.BR bootctl (1),
+.BR shim (8)
+.SH BUGS
+.B resign
+rebuilds UKIs from scratch via
+.BR kernel\-install .
+If you only want to re\-sign an already\-built UKI with a new key without
+rebuilding the initrd, use
+.B sbsign
+directly.

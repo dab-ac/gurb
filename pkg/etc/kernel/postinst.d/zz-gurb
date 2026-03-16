@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+version="$1"
+kernel="$2"
+[ -z "$version" ] && exit 0
+exec kernel-install add "$version" "$kernel"

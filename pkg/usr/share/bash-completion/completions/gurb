@@ -1,0 +1,35 @@
+_gurb() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="generate enroll clean resign cmdline status bootentry"
+    local global_opts="--dry-run --force --help"
+
+    local cmd=""
+    local i
+    for (( i=1; i < cword; i++ )); do
+        case "${words[$i]}" in
+            --dry-run|--force) continue ;;
+            --*) continue ;;
+            generate|enroll|clean|resign|cmdline|status|bootentry)
+                cmd="${words[$i]}"
+                break
+                ;;
+        esac
+    done
+
+    if [ -z "$cmd" ]; then
+        COMPREPLY=($(compgen -W "$commands $global_opts" -- "$cur"))
+        return
+    fi
+
+    case "$cmd" in
+        resign)
+            local kvers
+            kvers=$(for f in /boot/vmlinuz-*; do [ -e "$f" ] && echo "${f#/boot/vmlinuz-}"; done)
+            COMPREPLY=($(compgen -W "all $kvers" -- "$cur"))
+            ;;
+    esac
+}
+
+complete -F _gurb gurb

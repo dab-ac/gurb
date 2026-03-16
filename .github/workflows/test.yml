@@ -1,0 +1,46 @@
+name: Integration Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - grub-purge-upgrade
+          - kernel-lifecycle
+          - uninstall-reinstall
+          - key-rotation
+          - secure-boot
+          - fallback-boot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Run test-${{ matrix.test }}
+        run: |
+          nix develop --command bash -c '
+            export VM_DIR=/dev/shm VM_SMP=4 VM_RAM=4096
+            test/test-${{ matrix.test }}.pl
+          '
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ matrix.test }}
+          path: /dev/shm/test-${{ matrix.test }}/logs/

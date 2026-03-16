@@ -1,0 +1,15 @@
+#!/bin/sh
+COMMAND="$1"
+KERNEL_VERSION="$2"
+KERNEL_IMAGE="$4"
+
+case "$COMMAND" in
+    add)
+        [ -n "$KERNEL_IMAGE" ] || exit 0
+        ln -sf "$KERNEL_IMAGE" "/usr/lib/modules/$KERNEL_VERSION/vmlinuz"
+        ;;
+    remove)
+        rm -f "/usr/lib/modules/$KERNEL_VERSION/vmlinuz"
+        ;;
+esac
+exit 0
