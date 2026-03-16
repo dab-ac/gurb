@@ -90,7 +90,7 @@ mok_enroll($console_stream, 'gurbgurb');
 $console_stream->switch(log_phase("key-rotation-verify"));
 
 step("Verifying boot with new key");
-vm_status_like('cmdline', 'cat /proc/cmdline', '[..] console=ttyS0,115200 [..]');
+vm_status_like('cmdline', 'cat /proc/cmdline', '[..]console=ttyS0,115200[..]');
 vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status new key', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
@@ -108,23 +108,19 @@ EXPECT
 
 step("Testing gurb clean (old MOK should be UNUSED)");
 $work_stream->switch(log_phase("key-rotation-clean"));
-# clean is interactive — answer 'y' to delete the old MOK
 tmux_send(VMTest::tmux_work(), ssh_cmd_str('sudo gurb clean'), 'Enter');
 
-# Wait for UNUSED to appear (the old MOK)
-my $clean_out = $work_stream->wait_for(qr/Delete this MOK\?/i, 30);
-if ($clean_out) {
-    assert_contains('old MOK is UNUSED', $clean_out, 'UNUSED');
-    assert_contains('current MOK is KEEP', $clean_out, 'KEEP');
-    # Delete the old MOK
-    tmux_send(VMTest::tmux_work(), 'y', 'Enter');
-    $work_stream->wait_stable(3, 30);
-} else {
-    # If only one MOK, clean won't show UNUSED
-    $clean_out = $work_stream->read_all();
-    log_output("clean output", strip_ansi($clean_out));
-    assert_contains('MOK marked KEEP', strip_ansi($clean_out), 'KEEP');
+# Answer 'n' to each delete prompt to iterate through all MOKs
+for (1..10) {
+    my $chunk = $work_stream->wait_for(qr/Delete.*\[y\/N\]|KEEP/, 15);
+    last unless $chunk && $chunk =~ /Delete/;
+    tmux_send(VMTest::tmux_work(), 'n', 'Enter');
 }
+my $clean_out = strip_ansi($work_stream->read_all());
+log_output("clean output", $clean_out);
+
+assert_contains('old MOK is UNUSED', $clean_out, 'UNUSED');
+assert_contains('current MOK is KEEP', $clean_out, 'KEEP');
 
 vm_destroy();
 done();

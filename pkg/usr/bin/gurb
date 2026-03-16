@@ -274,7 +274,8 @@ sub cmd_clean () {
     require_uki_conf();
     -f $mok_cert or fatal("Cert not found: $mok_cert — run: gurb generate");
 
-    my @binaries = collect_binaries();
+    # Only check MOK-verified binaries (systemd-boot + UKIs), not shim/mm (db-verified)
+    my @binaries = grep { -f } "$shim_dir/grubx64.efi", glob("$uki_dir/*.efi");
 
     # Export enrolled MOKs as individual DER files into a tmpdir
     my $tmpdir = tempdir('gurb-clean.XXXXXX', TMPDIR => 1, CLEANUP => 1);
@@ -298,10 +299,13 @@ sub cmd_clean () {
             $fp =~ s/://g;
             $fp = substr($fp, -16);
 
-            # Check if this cert signs any of our binaries
+            # Convert DER to PEM for sbverify (which expects PEM)
+            my ($pem_fh, $pem_path) = tempfile(UNLINK => 1, SUFFIX => '.pem');
+            system('openssl', 'x509', '-inform', 'DER', '-in', $der, '-out', $pem_path) == 0 or next;
+
             my $used = 0;
             for my $bin (@binaries) {
-                my (undef, $rc) = capture_both('sbverify', '--cert', $der, $bin);
+                my (undef, $rc) = capture_both('sbverify', '--cert', $pem_path, $bin);
                 if ($rc == 0) {
                     $used = 1; last;
                 }
@@ -430,17 +434,6 @@ sub print_key_info () {
     }
     print "\n";
 
-    if (-f $mok_key) {
-        my $key_mode = (stat $mok_key)[2] & 07777;
-        my $dir_mode = (stat dirname($mok_key))[2] & 07777;
-        if ($key_mode & 0077 || $dir_mode & 0077) {
-            printf "WARNING: %s has mode %04o (dir %04o) — accessible by non-root users.\n",
-                   $mok_key, $key_mode, $dir_mode;
-            say "  The private key may have been compromised. Rotate with: gurb generate";
-            push @warnings, 'key permissions too loose';
-        }
-    }
-
     return @warnings;
 }
 
@@ -454,9 +447,79 @@ sub uki_cmdline ($path) {
     return trim($out);
 }
 
+sub check_permissions () {
+    my $is_root = $> == 0;
+    my $problems = 0;
+
+    # Private key must be restricted
+    if (-f $mok_key) {
+        my $mode = (stat $mok_key)[2] & 07777;
+        my $dir_mode = (stat dirname($mok_key))[2] & 07777;
+        if ($mode & 0077 || $dir_mode & 0077) {
+            say color('31', "CRITICAL: private key $mok_key is accessible by non-root (mode " .
+                sprintf("%04o, dir %04o", $mode, $dir_mode) . ")");
+            say "  The private key may have been compromised. Rotate with: sudo gurb generate";
+            if ($is_root && confirm("  Fix permissions now? (chmod 0600 key, 0700 dir) [Y/n] ")) {
+                chmod 0700, dirname($mok_key);
+                chmod 0600, $mok_key;
+                say "  Fixed.";
+            }
+            $problems++;
+        }
+    }
+
+    # Public cert/DER must be world-readable
+    for my $f ($mok_cert, $mok_der) {
+        next unless -f $f;
+        if (!-r $f) {
+            say color('33', "WARNING: $f is not readable (non-root status will be incomplete)");
+            if ($is_root && confirm("  Fix permissions? (chmod 0644) [Y/n] ")) {
+                chmod 0644, $f;
+                say "  Fixed.";
+            } elsif (!$is_root) {
+                say "  Re-run: sudo gurb status";
+                return 0;
+            }
+            $problems++;
+        }
+    }
+
+    # ESP directory must be readable
+    if (-e $shim_dir && !-r $shim_dir) {
+        say color('33', "WARNING: $shim_dir is not readable");
+        if ($is_root && confirm("  Fix permissions? (chmod 0755) [Y/n] ")) {
+            chmod 0755, $shim_dir;
+            say "  Fixed.";
+        } elsif (!$is_root) {
+            say "  Re-run: sudo gurb status";
+            return 0;
+        }
+        $problems++;
+    }
+
+    # UKI directory must be readable
+    if (-e $uki_dir && !-r $uki_dir) {
+        say color('33', "WARNING: $uki_dir is not readable");
+        if ($is_root && confirm("  Fix permissions? (chmod 0755) [Y/n] ")) {
+            chmod 0755, $uki_dir;
+            say "  Fixed.";
+        } elsif (!$is_root) {
+            say "  Re-run: sudo gurb status";
+            return 0;
+        }
+        $problems++;
+    }
+
+    say "" if $problems;
+    return 1;
+}
+
 sub cmd_status () {
     require_uki_conf();
     my $rc  = 0;
+
+    check_permissions() or return 1;
+
     my $state = -f $mok_der ? mok_state() : 'missing';
 
     # Check signature status. $trust = 'db' for shim/mm (any sig is OK),
@@ -503,14 +566,31 @@ sub cmd_status () {
     my $etc_cmdline = '';
     if (open my $fh, '<', '/etc/kernel/cmdline') { chomp($etc_cmdline = <$fh>); close $fh }
 
+    my $fmt_cmdline = sub ($label, $cmd) {
+        my @parts = split /\s+/, $cmd;
+        say "$label";
+        say "  $_" for @parts;
+    };
+
     if ($proc_cmdline eq $etc_cmdline && $etc_cmdline ne '') {
-        say "cmdline:  $etc_cmdline";
-    } else {
-        say "cmdline (running): $proc_cmdline" if $proc_cmdline ne '';
-        say "cmdline (/etc):    $etc_cmdline"  if $etc_cmdline ne '';
+        $fmt_cmdline->('cmdline:', $etc_cmdline);
+    } elsif ($proc_cmdline ne '' || $etc_cmdline ne '') {
         if ($etc_cmdline ne '' && $proc_cmdline ne '' && $proc_cmdline ne $etc_cmdline) {
-            say color('33', "  WARNING: running cmdline differs from /etc/kernel/cmdline — rebuild UKIs with: gurb resign all");
+            my %proc = map { $_ => 1 } split /\s+/, $proc_cmdline;
+            my %etc  = map { $_ => 1 } split /\s+/, $etc_cmdline;
+            say "cmdline (on next resign):";
+            for my $p (split /\s+/, $etc_cmdline) {
+                say $proc{$p} ? "  $p" : color('32', "  + $p  (new)");
+            }
+            for my $p (split /\s+/, $proc_cmdline) {
+                say color('31', "  - $p  (dropped)") unless $etc{$p};
+            }
+            say "  (`+` would be added by resign(+reboot), `-` would be removed)";
+            say color('33', "  Run: gurb resign all");
             $rc = 1;
+        } else {
+            $fmt_cmdline->('cmdline (running):', $proc_cmdline) if $proc_cmdline ne '';
+            $fmt_cmdline->('cmdline (/etc):', $etc_cmdline) if $etc_cmdline ne '';
         }
     }
     say "" if $proc_cmdline ne '' || $etc_cmdline ne '';
@@ -527,7 +607,14 @@ sub cmd_status () {
         next unless -f $uki;
         my $uki_cmd = uki_cmdline($uki);
         if (defined $uki_cmd && $etc_cmdline ne '' && $uki_cmd ne $etc_cmdline) {
-            say color('33', "  cmdline mismatch in next entry — UKI has: $uki_cmd");
+            my %etc = map { $_ => 1 } split /\s+/, $etc_cmdline;
+            my %uki = map { $_ => 1 } split /\s+/, $uki_cmd;
+            my @added   = grep { !$uki{$_} } split /\s+/, $etc_cmdline;
+            my @dropped = grep { !$etc{$_} } split /\s+/, $uki_cmd;
+            my @diff;
+            push @diff, map { color('32', "+$_") } @added;
+            push @diff, map { color('31', "-$_") } @dropped;
+            say color('33', "  stale cmdline: ") . join(' ', @diff);
             $rc = 1;
         }
         $status_line->($uki, basename($uki, '.efi'), 'mok');
@@ -657,5 +744,6 @@ my %dispatch = (
 );
 
 my $handler = $dispatch{$cmd} or fatal("unknown command: $cmd  (use --help)");
+fatal("gurb $cmd requires root. Use: sudo gurb $cmd") if $> != 0 && $cmd ne 'status';
 my $rc = $handler->() // 0;
 exit $rc;

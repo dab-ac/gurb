@@ -35,6 +35,8 @@ Source-level findings from the packages gurb interacts with.
 **`kernel-install.c` (systemd)**
 - `kernel_from_version()` — looks up `/usr/lib/modules/$ver/vmlinuz`
 - `verb_add()` — 1 arg = kernel image path (not version); 2 args = version + path
+- `context_set_machine_id()` — parses via `sd_id128_from_string()`; `MACHINE_ID=none` fails validation and is silently ignored (logged as warning). No config-file mechanism to suppress machine-id prefix.
+- Entry token priority: `/etc/kernel/entry-token` > `MACHINE_ID` from install.conf > `/etc/machine-id`
 
 **`src/boot/shim.c` (systemd)**
 - `shim_load_image()` — installs `shim_validate` security override
@@ -45,6 +47,29 @@ Source-level findings from the packages gurb interacts with.
 - `SbSign.verify()` — implemented correctly
 - Config keys: `UKI/SecureBootSigningTool`, `UKI/SecureBootPrivateKey`, `UKI/SecureBootCertificate`
 - `uki_conf_location()` — searches `/etc/kernel/uki.conf` first
+- `OSRelease=` in uki.conf: `@`-prefix reads from file, plain string is inline content
+- Auto-detects `/etc/os-release` if `OSRelease=` not set
+- No env var override for os-release; no way to inject kernel version into `.osrel` section without a pre-ukify hook or patching the file
+
+**`src/boot/boot.c` (systemd-boot display names)**
+- `bootspec_pick_name_version_sort_key()` picks `good_version` from os-release fields: `IMAGE_VERSION` > `VERSION` > `VERSION_ID` > `BUILD_ID`
+- For Type #2 UKI entries, `entry->version` = `good_version` from `.osrel`, NOT from `.uname` or filename
+- Multi-kernel same-OS UKIs always have identical `entry->version` (same os-release)
+- Dedup cascade: title → append version → append machine-id (8 chars) → append filename
+- Result: multi-kernel UKIs on Ubuntu always fall through to filename display
+- `.uname` section is only used by the stub at boot (not by the menu builder)
+
+**`src/kernel-install/60-ukify.install.in` (systemd)**
+- Python script that `exec()`s ukify as a module (not subprocess)
+- Sets `opts2.uname`, `opts2.linux`, `opts2.cmdline`, `opts2.config` programmatically
+- Does NOT set `opts2.os_release` — relies on ukify's auto-detect from `/etc/os-release`
+- No env var to override os-release content per-invocation
+- `kernel_cmdline()` appends `systemd.machine_id=` if entry_token == machine_id
+
+**`src/boot/boot.c` (OVMF fallback boot)**
+- `BmEnumerateBootOptions()` creates raw device-path entries for virtio disks
+- `BmExpandMediaDevicePath()` should resolve to `\EFI\BOOT\BOOTX64.EFI` but may boot-loop on virtio
+- shim's `should_use_fallback()` checks for `fbx64.efi` when loaded from `\EFI\BOOT\`; if present, chains to it instead of `grubx64.efi`. Without `BOOT*.CSV` files, `fbx64.efi` calls `ResetSystem()` in a loop
 
 **`install.d/50-dracut.install` (dracut)**
 - Exits if `KERNEL_INSTALL_IMAGE_TYPE=uki`

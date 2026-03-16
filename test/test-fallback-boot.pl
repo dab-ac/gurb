@@ -87,7 +87,7 @@ vm_ssh('sudo reboot');
 wait_ssh(180);
 
 step("Verifying fallback boot");
-vm_status_like('cmdline', 'cat /proc/cmdline', '[..] console=ttyS0,115200 [..]');
+vm_status_like('cmdline', 'cat /proc/cmdline', '[..]console=ttyS0,115200[..]');
 vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status post-fallback-boot', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...

@@ -138,16 +138,20 @@ EXPECT
 
 step("Testing gurb clean");
 $work_stream->switch(log_phase("clean"));
-# clean is interactive — run via tmux, answer 'n' to any delete prompts
 tmux_send(VMTest::tmux_work(), ssh_cmd_str('sudo gurb clean'), 'Enter');
-my $clean_out = $work_stream->wait_stable(3, 30);
-$clean_out //= $work_stream->read_all();
-$clean_out = strip_ansi($clean_out);
+# Answer 'n' to delete prompts (deletion requires mokutil password)
+for (1..10) {
+    my $chunk = $work_stream->wait_for(qr/Delete.*\[y\/N\]|KEEP/, 15);
+    last unless $chunk && $chunk =~ /Delete/;
+    tmux_send(VMTest::tmux_work(), 'n', 'Enter');
+}
+my $clean_out = strip_ansi($work_stream->read_all());
 log_output("clean output", $clean_out);
 
-# Our MOK should show as KEEP (it signs our binaries)
+# Our MOK should show as KEEP (it signs our binaries).
+# Canonical vendor cert may show as UNUSED — it's in MokListRT but doesn't
+# sign any MOK-verified binaries (it's the vendor_cert compiled into shim).
 assert_contains('MOK marked KEEP', $clean_out, 'KEEP');
-assert_not_contains('no UNUSED MOKs', $clean_out, 'UNUSED');
 
 vm_destroy();
 done();

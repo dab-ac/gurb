@@ -134,9 +134,11 @@ is diverted to `/etc/kernel/postinst.d/dracut.distrib` and replaced with an
 exit-0 no-op. Without this it would run alongside `zz-gurb` and generate
 a redundant `/boot/initrd.img-$kver` that is never used.
 
-`MACHINE_ID=` (empty) in `install.conf` suppresses the machine-id prefix from
-UKI filenames. systemd-boot scans `/efi/EFI/Linux/*.efi` and reads the
-`.osrel` PE section for display; filename format is irrelevant to it.
+`/etc/kernel/entry-token` is set to `gurb`, giving UKI filenames like
+`gurb-6.14.0-37-generic.efi`. Without this, kernel-install uses the
+machine-id as a prefix (`c84b2b4b…-6.14.0-37-generic.efi`).
+`MACHINE_ID=none` in `install.conf` does not work on systemd 257 —
+`sd_id128_from_string("none")` fails and the setting is silently ignored.
 
 The vmlinuz symlink at `/usr/lib/modules/$kver/vmlinuz` is needed because
 Ubuntu inexplicably installs kernels to `/boot/vmlinuz-$kver` instead of the

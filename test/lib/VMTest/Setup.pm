@@ -114,7 +114,7 @@ sub setup_gurb (%opts) {
     $cs->switch(log_phase("post-mok-console"));
 
     step("Verifying boot after MOK enrollment");
-    vm_status_like('cmdline', 'cat /proc/cmdline', '[..] console=ttyS0,115200 [..]');
+    vm_status_like('cmdline', 'cat /proc/cmdline', '[..]console=ttyS0,115200[..]');
     vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
     vm_status_like('status post-MOK', 'sudo gurb status', <<~'EXPECT', 'MISSING');
         ...
