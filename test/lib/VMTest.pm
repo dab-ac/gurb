@@ -393,8 +393,9 @@ sub wait_ssh ($timeout = 180) {
     log_msg("waiting for SSH (timeout=${timeout}s)");
     my $deadline = Time::HiRes::time() + $timeout;
     my @cmd = (_ssh_args(connect_timeout => 2), 'true');
-    # Wait for SSH to go down first (guest may still be shutting down)
-    for (1..30) {
+    # Give the guest time to begin shutting down before checking
+    Time::HiRes::sleep(3);
+    for (1..20) {
         last if system("@cmd >/dev/null 2>&1") != 0;
         Time::HiRes::sleep(0.5);
     }
