@@ -29,7 +29,7 @@ Secure Boot signing lifecycle via a single local package.
 ## Quickstart
 
 ```bash
-# ESP must be mounted at /efi (or set shim= in /etc/gurb/config)
+# ESP must be mounted at /efi (or set shim= in /etc/gurb.conf)
 apt install ./gurb.deb
 gurb generate                  # creates MOK key, queues enrollment
 gurb cmdline                   # generates /etc/kernel/cmdline from dracut
@@ -48,15 +48,16 @@ See `man gurb` for full configuration and command reference.
 ## Uninstall
 
 `apt remove gurb` removes the package but preserves:
-- `/etc/gurb/config` — user configuration (not a dpkg conffile)
+- `/etc/gurb.conf` — configuration (dpkg conffile, preserved on remove)
 - `/var/lib/shim-signed/mok/` — MOK signing key, certificate, and DER
 - ESP files (`/efi/EFI/systemd/`) — shim, systemd-boot, UKIs
 
-`apt purge gurb` additionally removes dpkg-managed conffiles under `/etc/kernel/`
-(`uki.conf`, `install.conf`, `zz-gurb` hooks), but the MOK key and user config
-survive (they live outside dpkg's conffile tracking). This is intentional — the
-MOK is enrolled in UEFI firmware and deleting the private key would make it
-impossible to re-sign binaries without a full MokManager re-enrollment.
+`apt purge gurb` additionally removes conffiles (`/etc/gurb.conf`,
+`/etc/kernel/uki.conf`, `/etc/kernel/install.conf`, hooks), but the MOK key
+survives (it lives in `/var/lib/`, outside dpkg conffile tracking). This is
+intentional — the MOK is enrolled in UEFI firmware and deleting the private
+key would make it impossible to re-sign binaries without full MokManager
+re-enrollment.
 
 ## Key and certificate
 
@@ -70,6 +71,20 @@ One key, one MOK enrollment, serves three purposes:
    against keys loaded at boot from the MOK database
 
 The certificate uses `extendedKeyUsage = codeSigning` only.
+
+**Coexistence with Ubuntu's DKMS MOK:** Ubuntu's `update-secureboot-policy`
+(from `shim-signed`) creates a MOK at the same path (`/var/lib/shim-signed/mok/`)
+with the modsign OID (`1.3.6.1.4.1.2312.16.1.2`). Shim explicitly blacklists
+that OID for EFI binary verification — the DKMS key can only sign kernel modules,
+not bootloaders or UKIs. `gurb generate` detects an existing key, displays its
+properties (including the modsign OID warning), and asks before overwriting.
+Both keys can coexist in MOK NVRAM but they cannot share the same file path.
+
+**Fallback boot path (`\EFI\BOOT\BOOTX64.EFI`):** Set `shim=/efi/EFI/BOOT/BOOTX64.EFI`
+in `/etc/gurb.conf` to install shim to the UEFI fallback path. If the cloud image
+or a previous OS left `fbx64.efi` (shim's fallback binary) in that directory,
+remove it — shim chains to fbx64 when loaded from `\EFI\BOOT\`, and without
+`BOOT*.CSV` files it enters a reset loop. `gurb status` warns about this.
 
 **Why not the modsign OID (`1.3.6.1.4.1.2312.16.1.2`)?**
 Shim's `verify_eku()` (in `shim.c`) explicitly **blacklists** any certificate

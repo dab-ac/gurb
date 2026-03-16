@@ -39,13 +39,14 @@ vm_ssh_ok('sudo rm -rf /boot/grub');
 step("Verifying GRUB removed");
 vm_status_like('status post-grub-purge', 'sudo gurb status', <<~'EXPECT',
     ...
-    shim          [..] SIGNED
+    shim          [..] OK
     ...
-    mm            [..] SIGNED(other)
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
+    mm            [..] OK
+    systemd-boot  [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
 EXPECT
     'MISSING', 'GRUB');
 
@@ -109,14 +110,15 @@ for my $pkg (qw(grub-common grub2-common grub-efi-amd64-signed grub-pc)) {
 
 vm_status_like('status post-upgrade', 'sudo gurb status', <<~'EXPECT',
     ...
-    shim          [..] SIGNED
+    shim          [..] OK
     ...
-    mm            [..] SIGNED(other)
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
-    *-generic     [..] SIGNED
+    mm            [..] OK
+    systemd-boot  [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
 EXPECT
     'MISSING', 'GRUB');
 

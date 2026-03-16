@@ -37,13 +37,13 @@ step("Testing --dry-run cmdline");
 my $cmdline_before = vm_ssh_ok('cat /etc/kernel/cmdline');
 $work_stream->switch(log_phase("dry-run-cmdline"));
 # Change cmdline_extra to trigger a diff
-vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200 quiet' | sudo tee /etc/gurb/config");
+vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200 quiet' | sudo tee /etc/gurb.conf");
 my $dry_cmd = vm_ssh_ok('sudo gurb --dry-run cmdline');
 my $cmdline_after = vm_ssh_ok('cat /etc/kernel/cmdline');
 chomp($cmdline_before, $cmdline_after);
 assert_contains('cmdline unchanged', $cmdline_after, $cmdline_before);
 # Restore original config
-vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200' | sudo tee /etc/gurb/config");
+vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200' | sudo tee /etc/gurb.conf");
 
 # ── dry-run: generate (skipped — interactive prompt can't be tested via ssh) ──
 
@@ -73,9 +73,9 @@ assert_not_contains('UKI re-signed', $uki_after, $uki_before);
 # Verify still SIGNED
 vm_status_like('status after single resign', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    *-generic     [..] SIGNED
+    *-generic     [..] OK
     ...
-    MOK: enrolled
+    MOK: [..]enrolled
     ...
 EXPECT
 
@@ -106,10 +106,10 @@ say "  Second UKI: $kern_uki";
 
 vm_status_like('status two kernels', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    *-generic     [..] SIGNED
-    *-generic     [..] SIGNED
+    *-generic     [..] OK
+    *-generic     [..] OK
     ...
-    MOK: enrolled
+    MOK: [..]enrolled
     ...
 EXPECT
 
@@ -128,9 +128,9 @@ if ($uki_rc == 0) {
 
 vm_status_like('status one kernel', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    *-generic     [..] SIGNED
+    *-generic     [..] OK
     ...
-    MOK: enrolled
+    MOK: [..]enrolled
     ...
 EXPECT
 

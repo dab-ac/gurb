@@ -34,7 +34,7 @@ vm_ssh_ok('sudo rm -rf /boot/grub');
 # ── install shim to fallback path ────────────────────────────────────────────
 
 step("Configuring fallback boot path");
-vm_ssh_ok("sudo tee /etc/gurb/config <<'EOF'
+vm_ssh_ok("sudo tee /etc/gurb.conf <<'EOF'
 shim=/efi/EFI/BOOT/BOOTX64.EFI
 cmdline_extra=console=ttyS0,115200
 EOF");
@@ -56,11 +56,11 @@ assert_contains('resign all exits cleanly', ($resign_rc == 0 ? 'ok' : "rc=$resig
 step("Verifying status with fallback path");
 vm_status_like('status fallback', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    shim          [..]/EFI/BOOT/BOOTX64.EFI [..] SIGNED
+    shim          [..]/EFI/BOOT/BOOTX64.EFI [..] OK
     ...
-    systemd-boot  [..]/EFI/BOOT/grubx64.efi [..] SIGNED
+    systemd-boot  [..]/EFI/BOOT/grubx64.efi [..] OK
     ...
-    MOK: enrolled
+    MOK: [..]enrolled
     ...
 EXPECT
 
@@ -91,12 +91,13 @@ vm_status_like('cmdline', 'cat /proc/cmdline', '[..] console=ttyS0,115200 [..]')
 vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status post-fallback-boot', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    shim          [..]/EFI/BOOT/BOOTX64.EFI [..] SIGNED
+    shim          [..]/EFI/BOOT/BOOTX64.EFI [..] OK
     ...
-    systemd-boot  [..]/EFI/BOOT/grubx64.efi [..] SIGNED
-    *-generic     [..] SIGNED
+    systemd-boot  [..]/EFI/BOOT/grubx64.efi [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
     ...
 EXPECT
 

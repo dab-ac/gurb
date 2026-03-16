@@ -105,10 +105,11 @@ step("Verifying recovery (Test A)");
 vm_status_like('secure boot on', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status post-recovery-A', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
+    systemd-boot  [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
     ...
 EXPECT
 
@@ -157,10 +158,11 @@ step("Verifying recovery (Test B)");
 vm_status_like('secure boot on', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status post-recovery-B', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
+    systemd-boot  [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
     ...
 EXPECT
 

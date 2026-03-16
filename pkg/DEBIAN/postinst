@@ -14,7 +14,7 @@ sub read_config ($path) {
     return %cfg;
 }
 
-my %cfg = read_config('/etc/gurb/config');
+my %cfg = read_config('/etc/gurb.conf');
 my $shim_efi = $cfg{shim} // '/efi/EFI/systemd/shimx64.efi';
 my $shim_dir = dirname($shim_efi);
 

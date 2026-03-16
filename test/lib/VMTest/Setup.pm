@@ -45,7 +45,7 @@ sub setup_gurb (%opts) {
     step("Verifying gurb installed");
     vm_status_like('status post-install', 'sudo gurb status', <<~'EXPECT');
         ...
-        shim [..] SIGNED
+        shim [..] OK
         ...
         Key/cert not found [..]
         ...
@@ -69,18 +69,18 @@ sub setup_gurb (%opts) {
     step("Verifying MOK is pending");
     vm_status_like('status post-generate', 'sudo gurb status', <<~'EXPECT');
         ...
-        shim [..] SIGNED
+        shim [..] OK
         ...
         Key: [..]
         ...
-        MOK: pending
+        MOK: [..]pending[..]
         ...
     EXPECT
 
     # ── cmdline ───────────────────────────────────────────────────────────
 
     step("Setting cmdline with serial console");
-    vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200' | sudo tee /etc/gurb/config");
+    vm_ssh_ok("echo 'cmdline_extra = console=ttyS0,115200' | sudo tee /etc/gurb.conf");
 
     $ws->switch(log_phase("cmdline"));
     tmux_send(VMTest::tmux_work(), ssh_cmd_str('sudo gurb cmdline'), 'Enter');
@@ -118,12 +118,13 @@ sub setup_gurb (%opts) {
     vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
     vm_status_like('status post-MOK', 'sudo gurb status', <<~'EXPECT', 'MISSING');
         ...
-        shim          [..] SIGNED
+        shim          [..] OK
         ...
-        systemd-boot  [..] SIGNED
-        *-generic     [..] SIGNED
+        systemd-boot  [..] OK
         ...
-        MOK: enrolled
+        *-generic     [..] OK
+        ...
+        MOK: [..]enrolled
         ...
     EXPECT
 

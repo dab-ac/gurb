@@ -30,7 +30,7 @@ my $shim_efi      = '/efi/EFI/systemd/shimx64.efi';
 my $uki_dir       = '/efi/EFI/Linux';
 my $cmdline_extra = '';
 
-my %cfg = read_config('/etc/gurb/config');
+my %cfg = read_config('/etc/gurb.conf');
 $shim_efi      = $cfg{shim}          // $shim_efi;
 $uki_dir       = $cfg{uki_dir}       // $uki_dir;
 $cmdline_extra = $cfg{cmdline_extra} // $cmdline_extra;
@@ -142,9 +142,10 @@ sub mok_state () {
     my ($out, $rc) = capture_both('mokutil', '--test-key', $mok_der);
     # exit 0 = not enrolled (mokutil 0.7.2); exit 1 = present in some form
     return 'missing' if $rc == 0;
-    return 'enrolled' if $out =~ /is already enrolled/ || $out =~ /is already in db/;
-    return 'pending'  if $out =~ /is already in the enrollment request/;
-    return 'blocked'  if $out =~ /is blocked/;
+    return 'enrolled'        if $out =~ /is already enrolled/ || $out =~ /is already in db/;
+    return 'pending'         if $out =~ /is already in the enrollment request/;
+    return 'pending-delete'  if $out =~ /is already in the deletion request/;
+    return 'blocked'         if $out =~ /is blocked/;
     return 'missing';
 }
 
@@ -181,7 +182,7 @@ sub esp_mount () {
     my $mount = capture('findmnt', '-n', '-o', 'TARGET', '--target', $shim_dir);
     if ($mount eq '' || $mount eq '/') {
         fatal("ESP not mounted — $shim_dir resolves to root filesystem.\n" .
-              "  Mount your ESP (e.g., mount /dev/sdX15 /efi) or set shim= in /etc/gurb/config.");
+              "  Mount your ESP (e.g., mount /dev/sdX15 /efi) or set shim= in /etc/gurb.conf.");
     }
     return $mount;
 }
@@ -442,45 +443,98 @@ sub print_key_info () {
     return @warnings;
 }
 
+my $isatty = -t STDOUT;
+sub color ($code, $text) { $isatty ? "\e[${code}m${text}\e[0m" : $text }
+
+sub uki_cmdline ($path) {
+    my ($out, $rc) = capture_both('objcopy', '-O', 'binary', '--only-section=.cmdline', $path, '/dev/stdout');
+    return undef if $rc != 0;
+    $out =~ s/\0+$//;
+    return trim($out);
+}
+
 sub cmd_status () {
     require_uki_conf();
     my $rc  = 0;
-    my $fmt = "%-12s  %-52s  %-16s  %s\n";
+    my $state = -f $mok_der ? mok_state() : 'missing';
 
-    my $check_sig = sub ($path) {
-        my (undef, $exit) = capture_both('sbverify', '--cert', $mok_cert, $path);
-        return 'SIGNED' if $exit == 0;
-        my $list = capture('sbverify', '--list', $path);
-        return 'SIGNED(other)' if $list =~ /signature \d+/;
-        return 'UNSIGNED';
+    # Check signature status. $trust = 'db' for shim/mm (any sig is OK),
+    # 'mok' for systemd-boot/UKIs (must be signed by our enrolled/pending cert).
+    # Returns ($status, $detail) where $detail explains WRONG.
+    my $check_sig = sub ($path, $trust) {
+        my ($list) = capture_both('sbverify', '--list', $path);
+        my $has_any_sig = $list =~ /signature \d+/;
+        if ($trust eq 'db') {
+            return ($has_any_sig ? 'OK' : 'UNSIGNED', '');
+        }
+        # MOK-verified binary: must be signed by our cert
+        if (-f $mok_cert) {
+            my (undef, $exit) = capture_both('sbverify', '--cert', $mok_cert, $path);
+            return ('OK', '') if $exit == 0;
+        }
+        return ('UNSIGNED', '') unless $has_any_sig;
+        # Signed by something, but not our cert — figure out what
+        my $detail = 'signed by unknown key';
+        $detail = 'signed by old/different MOK — run: gurb resign all' if !-f $mok_cert;
+        $detail = 'not signed by current MOK — run: gurb resign all'  if -f $mok_cert;
+        return ('WRONG', $detail);
     };
 
-    my $status_line = sub ($path, $label) {
+    my %sig_color = (OK => '32', WRONG => '33', UNSIGNED => '31', MISSING => '31');
+
+    my $fmt = "%-12s  %-52s  %-16s  %s\n";
+    my $status_line = sub ($path, $label, $trust) {
         unless (-f $path) {
-            printf $fmt, $label, $path, '', 'MISSING';
-            $rc = 1; return;
+            printf $fmt, $label, $path, '', color('31', 'MISSING');
+            $rc = 1; return 'MISSING';
         }
         my $mtime = strftime('%Y-%m-%d %H:%M', localtime((stat $path)[9]));
-        my $sig   = $check_sig->($path);
-        $rc = 1 if $sig ne 'SIGNED';
-        printf $fmt, $label, $path, $mtime, $sig;
+        my ($sig, $detail) = $check_sig->($path, $trust);
+        say color('33', "  $detail") if $detail;
+        $rc = 1 if $sig ne 'OK';
+        printf $fmt, $label, $path, $mtime, color($sig_color{$sig}, $sig);
+        return $sig;
     };
 
+    # ── cmdline ───────────────────────────────────────────────────────────
+    my $proc_cmdline = '';
+    if (open my $fh, '<', '/proc/cmdline') { chomp($proc_cmdline = <$fh>); close $fh }
+    my $etc_cmdline = '';
+    if (open my $fh, '<', '/etc/kernel/cmdline') { chomp($etc_cmdline = <$fh>); close $fh }
+
+    if ($proc_cmdline eq $etc_cmdline && $etc_cmdline ne '') {
+        say "cmdline:  $etc_cmdline";
+    } else {
+        say "cmdline (running): $proc_cmdline" if $proc_cmdline ne '';
+        say "cmdline (/etc):    $etc_cmdline"  if $etc_cmdline ne '';
+        if ($etc_cmdline ne '' && $proc_cmdline ne '' && $proc_cmdline ne $etc_cmdline) {
+            say color('33', "  WARNING: running cmdline differs from /etc/kernel/cmdline — rebuild UKIs with: gurb resign all");
+            $rc = 1;
+        }
+    }
+    say "" if $proc_cmdline ne '' || $etc_cmdline ne '';
+
+    # ── EFI binaries ──────────────────────────────────────────────────────
     printf $fmt, 'WHAT', 'PATH', 'MTIME', 'SIG';
     say '-' x 68;
 
-    $status_line->($shim_efi,               'shim');
-    $status_line->("$shim_dir/mmx64.efi",   'mm');
-    $status_line->("$shim_dir/grubx64.efi", 'systemd-boot');
+    $status_line->($shim_efi,               'shim',         'db');
+    $status_line->("$shim_dir/mmx64.efi",   'mm',           'db');
+    $status_line->("$shim_dir/grubx64.efi", 'systemd-boot', 'mok');
 
     for my $uki (sort glob "$uki_dir/*.efi") {
         next unless -f $uki;
-        $status_line->($uki, basename($uki, '.efi'));
+        my $uki_cmd = uki_cmdline($uki);
+        if (defined $uki_cmd && $etc_cmdline ne '' && $uki_cmd ne $etc_cmdline) {
+            say color('33', "  cmdline mismatch in next entry — UKI has: $uki_cmd");
+            $rc = 1;
+        }
+        $status_line->($uki, basename($uki, '.efi'), 'mok');
     }
 
     print "\n";
 
-    # Key/cert status
+    # ── key/cert status ───────────────────────────────────────────────────
     if (-f $mok_cert) {
         my @warnings = print_key_info();
         $rc = 1 if @warnings;
@@ -491,21 +545,33 @@ sub cmd_status () {
             my $der_fp = x509_field($mok_der, '-inform', 'DER', '-fingerprint', '-sha256', '-noout');
             s/^.*=// for $pem_fp, $der_fp;
             if ($pem_fp ne $der_fp) {
-                say "WARNING: MOK.der and MOK.pem do not match — run: gurb enroll";
+                say color('33', "WARNING: MOK.der and MOK.pem do not match — run: gurb enroll");
                 $rc = 1;
             }
         } else {
-            say "WARNING: $mok_der missing — run: gurb enroll";
+            say color('33', "WARNING: $mok_der missing — run: gurb enroll");
             $rc = 1;
         }
 
-        printf "MOK:      %s\n", mok_state();
+        my $mok_display = $state;
+        if ($state eq 'enrolled') {
+            $mok_display = color('32', 'enrolled');
+        } elsif ($state eq 'pending') {
+            $mok_display = color('33', 'pending — reboot and confirm in MokManager');
+        } elsif ($state eq 'pending-delete') {
+            $mok_display = color('31', 'PENDING DELETION — reboot will remove this MOK from firmware');
+            $rc = 1;
+        } elsif ($state eq 'blocked') {
+            $mok_display = color('31', 'BLOCKED — MOK is in the blocklist');
+            $rc = 1;
+        }
+        printf "MOK:      %s\n", $mok_display;
     } else {
         say "Key/cert not found — run: gurb generate";
         $rc = 1;
     }
 
-    # Suggest grub cleanup
+    # ── warnings ──────────────────────────────────────────────────────────
     my @grub_installed;
     for my $pkg (qw(grub-common grub2-common grub-efi-amd64-signed grub-pc)) {
         my ($st) = capture_both('dpkg-query', '-W', '-f', '${Status}', $pkg);
@@ -522,7 +588,7 @@ sub cmd_status () {
 
     my $fb = "$shim_dir/fbx64.efi";
     if (-f $fb && $shim_dir =~ m{/EFI/BOOT$}i) {
-        say "\nWARNING: $fb exists — shim will chain to it instead of systemd-boot.";
+        say color('31', "\nWARNING: $fb exists — shim will chain to it instead of systemd-boot.");
         say "  Remove it: sudo rm $fb";
         $rc = 1;
     }

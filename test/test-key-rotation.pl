@@ -58,7 +58,7 @@ assert_not_contains('key rotated', $new_fp, $orig_fp);
 step("Verifying new MOK is pending");
 vm_status_like('new MOK pending', 'sudo gurb status', <<~'EXPECT');
     ...
-    MOK: pending
+    MOK: [..]pending[..]
     ...
 EXPECT
 
@@ -71,12 +71,13 @@ assert_contains('resign --force all exits cleanly', ($resign_rc == 0 ? 'ok' : "r
 # Binaries are now signed with new key (not yet enrolled)
 vm_status_like('status after resign', 'sudo gurb status', <<~'EXPECT');
     ...
-    shim          [..] SIGNED
+    shim          [..] OK
     ...
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
+    systemd-boot  [..] OK
     ...
-    MOK: pending
+    *-generic     [..] OK
+    ...
+    MOK: [..]pending[..]
     ...
 EXPECT
 
@@ -93,12 +94,13 @@ vm_status_like('cmdline', 'cat /proc/cmdline', '[..] console=ttyS0,115200 [..]')
 vm_status_like('secure boot', 'mokutil --sb-state', 'SecureBoot enabled');
 vm_status_like('status new key', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...
-    shim          [..] SIGNED
+    shim          [..] OK
     ...
-    systemd-boot  [..] SIGNED
-    *-generic     [..] SIGNED
+    systemd-boot  [..] OK
     ...
-    MOK: enrolled
+    *-generic     [..] OK
+    ...
+    MOK: [..]enrolled
     ...
 EXPECT
 
