@@ -244,7 +244,8 @@ sub cmd_generate () {
         system('openssl', 'x509', '-in', $mok_cert, '-outform', 'DER',
                '-out', $mok_der) == 0
             or fatal("openssl x509 DER conversion failed");
-        chmod 0600, $mok_key, $mok_cert, $mok_der;
+        chmod 0600, $mok_key;
+        chmod 0644, $mok_cert, $mok_der;
         say "Generated: $mok_key";
         say "Generated: $mok_cert";
         say "Generated: $mok_der";
