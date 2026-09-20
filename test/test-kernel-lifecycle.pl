@@ -70,6 +70,9 @@ my $uki_after = vm_ssh_ok("sudo sha256sum $uki_path");
 # Hash should differ (re-signed with fresh timestamp in PE)
 assert_not_contains('UKI re-signed', $uki_after, $uki_before);
 
+my $osrel = vm_ssh_ok("sudo /usr/lib/systemd/ukify inspect $uki_path");
+assert_contains('UKI version is kernel version', $osrel, qq{IMAGE_VERSION="$kver"});
+
 # Verify still SIGNED
 vm_status_like('status after single resign', 'sudo gurb status', <<~'EXPECT', 'MISSING', 'UNSIGNED');
     ...

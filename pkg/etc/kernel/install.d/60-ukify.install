@@ -1,0 +1,42 @@
+#!/bin/sh
+set -eu
+builder=/usr/lib/kernel/install.d/60-ukify.install
+
+if [ "${1:-}" != add ] || [ "${KERNEL_INSTALL_LAYOUT:-}" != uki ] ||
+   [ "${KERNEL_INSTALL_IMAGE_TYPE:-}" = uki ] ||
+   [ "${KERNEL_INSTALL_UKI_GENERATOR:-ukify}" != ukify ]; then
+    exec "$builder" "$@"
+fi
+
+case "${2:-}" in
+    ''|*[!a-zA-Z0-9._+~-]*) echo 'gurb: invalid kernel version' >&2; exit 1 ;;
+esac
+
+work=$(mktemp -d "${KERNEL_INSTALL_STAGING_AREA:?}/gurb-ukify.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+if [ -n "${KERNEL_INSTALL_CONF_ROOT:-}" ]; then
+    cp -a "$KERNEL_INSTALL_CONF_ROOT/." "$work/"
+    config=$KERNEL_INSTALL_CONF_ROOT/uki.conf
+else
+    for dir in /usr/lib/kernel /etc/kernel; do
+        if [ -d "$dir" ]; then cp -a "$dir/." "$work/"; fi
+    done
+    config=
+    for dir in /etc/kernel /run/kernel /usr/local/lib/kernel /usr/lib/kernel; do
+        if [ -f "$dir/uki.conf" ]; then config=$dir/uki.conf; break; fi
+    done
+fi
+rm -f "$work/uki.conf"
+if [ -n "$config" ] && [ -f "$config" ]; then
+    cp -L "$config" "$work/uki.conf"
+fi
+
+osrel=/etc/os-release
+[ -f "$osrel" ] || osrel=/usr/lib/os-release
+# systemd-boot prefers IMAGE_VERSION over Ubuntu's non-sortable VERSION.
+rm -f "$work/gurb-os-release"
+sed '/^IMAGE_VERSION=/d' "$osrel" > "$work/gurb-os-release"
+printf '\nIMAGE_VERSION="%s"\n' "$2" >> "$work/gurb-os-release"
+printf '\n[UKI]\nOSRelease=@%s/gurb-os-release\n' "$work" >> "$work/uki.conf"
+
+KERNEL_INSTALL_CONF_ROOT="$work" "$builder" "$@"

@@ -32,6 +32,9 @@ jobs:
 
       - uses: DeterminateSystems/nix-installer-action@main
 
+      - name: Test UKI version metadata
+        run: nix develop --command perl test/t/test-uki-version.pl
+
       - name: Run test-${{ matrix.test }}
         run: |
           nix develop --command bash -c '

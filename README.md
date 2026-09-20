@@ -164,6 +164,30 @@ Scanning `/boot/vmlinuz-*` (the canonical location Ubuntu actually installs
 to) avoids this entirely: `kernel-install` receives an absolute path to a
 real file, and the symlink hook creates a correct symlink pointing back at it.
 
+## Boot entry ordering
+
+The `60-ukify.install` wrapper delegates to systemd's builder with a temporary
+configuration and an `.osrel` containing `IMAGE_VERSION=<kernel version>`.
+This makes systemd-boot sort kernels numerically instead of using Ubuntu's
+human-readable `VERSION`: for example, systemd compares `26.04 LTS (...)` as
+**newer** than `26.04.1 LTS (...)`, incorrectly preferring an older kernel.
+The host's `/etc/os-release` and signing configuration are not modified.
+The wrapper supplies the host OS identity, overriding any `OSRelease=` setting
+for kernel-install builds.
+
+After upgrading gurb, rebuild **all** existing images so their metadata uses the
+same version scheme:
+
+```sh
+sudo gurb resign all
+sudo bootctl list
+```
+
+This does not override an explicitly selected default or one-shot boot entry.
+Old machine-ID-prefixed images from before an entry-token change may coexist
+with rebuilt images; inspect `bootctl list` before rebooting and remove obsolete
+entries only after verifying their replacements.
+
 ## ESP layout
 
 ```
